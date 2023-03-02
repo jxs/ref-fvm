@@ -55,8 +55,6 @@ impl<K> Executor for DefaultExecutor<K>
 where
     K: Kernel,
 {
-    type Kernel = K;
-
     /// This is the entrypoint to execute a message.
     fn execute_message(
         &mut self,

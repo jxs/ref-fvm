@@ -18,7 +18,6 @@ pub use threaded::ThreadedExecutor;
 
 use crate::call_manager::Backtrace;
 use crate::trace::ExecutionTrace;
-use crate::Kernel;
 
 /// An executor executes messages on the underlying machine/kernel. It's responsible for:
 ///
@@ -26,11 +25,6 @@ use crate::Kernel;
 /// 2. Creating message receipts.
 /// 3. Charging message inclusion gas, overestimation gas, miner tip, etc.
 pub trait Executor {
-    /// The [`Kernel`] on which messages will be applied. We specify a [`Kernel`] here, not a
-    /// [`Machine`](crate::machine::Machine), because the [`Kernel`] implies the
-    /// [`Machine`](crate::machine::Machine).
-    type Kernel: Kernel;
-
     /// This is the entrypoint to execute a message.
     ///
     /// NOTE: The "raw length" is the length of the message as it appears on-chain and is used to

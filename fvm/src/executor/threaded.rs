@@ -29,8 +29,6 @@ impl<E> Executor for ThreadedExecutor<E>
 where
     E: Executor + Send,
 {
-    type Kernel = E::Kernel;
-
     /// This is the entrypoint to execute a message.
     fn execute_message(
         &mut self,
