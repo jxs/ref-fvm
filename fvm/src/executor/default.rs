@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 use std::result::Result as StdResult;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use cid::Cid;
 use fvm_ipld_encoding::{RawBytes, CBOR};
 use fvm_shared::address::Payload;
@@ -15,7 +15,7 @@ use fvm_shared::{ActorID, IPLD_RAW, METHOD_SEND};
 use num_traits::Zero;
 
 use super::{ApplyFailure, ApplyKind, ApplyRet, Executor};
-use crate::call_manager::{backtrace, Backtrace, CallManager, InvocationResult};
+use crate::call_manager::{backtrace, CallManager, FinishRet, InvocationResult};
 use crate::eam_actor::EAM_ACTOR_ID;
 use crate::engine::EnginePool;
 use crate::gas::{Gas, GasCharge, GasOutputs};
@@ -54,15 +54,6 @@ where
                 Err(apply_ret) => return Ok(apply_ret),
             };
 
-        struct MachineExecRet {
-            result: crate::kernel::error::Result<InvocationResult>,
-            gas_used: u64,
-            backtrace: Backtrace,
-            exec_trace: ExecutionTrace,
-            events_root: Option<Cid>,
-            events: Vec<StampedEvent>, // TODO consider removing if nothing in the client ends up using it.
-        }
-
         // Pre-resolve the message receiver's address, if known.
         let receiver_id = self
             .machine()
@@ -82,100 +73,90 @@ where
         // messages inside other executors sharing the same pool.
         let engine = self.engine_pool.acquire();
 
-        // Apply the message.
-        let ret = self.map_machine(|machine| {
-            // We're processing a chain message, so the sender is the origin of the call stack.
-            let mut cm = K::CallManager::new(
-                machine,
-                engine,
-                msg.gas_limit,
+        let machine = self.machine.take().expect("machine poisoned");
+
+        // let ret = self.map_machine(|machine| {
+        // We're processing a chain message, so the sender is the origin of the call stack.
+        let mut cm = K::CallManager::new(
+            machine,
+            engine,
+            msg.gas_limit,
+            sender_id,
+            msg.from,
+            receiver_id,
+            msg.to,
+            msg.sequence,
+            effective_premium,
+        );
+        // This error is fatal because it should have already been accounted for inside
+        // preflight_message.
+        if let Err(e) = cm.charge_gas(inclusion_cost) {
+            let (_, machine) = cm.finish();
+            self.machine = Some(machine);
+            bail!(e);
+        }
+
+        let params = (!msg.params.is_empty()).then(|| {
+            Block::new(
+                if msg.method_num == METHOD_SEND {
+                    // Method zero params are "arbitrary bytes", so we'll just count them as
+                    // raw.
+                    //
+                    // This won't actually affect anything (because no code will see these
+                    // parameters), but it's more correct and makes me happier.
+                    //
+                    // NOTE: this _may_ start to matter once we start _validating_ ipld (m2.2).
+                    IPLD_RAW
+                } else {
+                    // This is CBOR, not DAG_CBOR, because links sent from off-chain aren't
+                    // reachable.
+                    CBOR
+                },
+                msg.params.bytes(),
+            )
+        });
+
+        let result = cm.with_transaction(|cm| {
+            // Invoke the message.
+            let ret = cm.send::<K>(
                 sender_id,
-                msg.from,
-                receiver_id,
                 msg.to,
-                msg.sequence,
-                effective_premium,
-            );
-            // This error is fatal because it should have already been accounted for inside
-            // preflight_message.
-            if let Err(e) = cm.charge_gas(inclusion_cost) {
-                let (_, machine) = cm.finish();
-                return (Err(e), machine);
+                msg.method_num,
+                params,
+                &msg.value,
+                None,
+                false,
+            )?;
+
+            // Charge for including the result (before we end the transaction).
+            if let Some(value) = &ret.value {
+                let _ = cm.charge_gas(
+                    cm.context()
+                        .price_list
+                        .on_chain_return_value(value.size() as usize),
+                )?;
             }
 
-            let params = (!msg.params.is_empty()).then(|| {
-                Block::new(
-                    if msg.method_num == METHOD_SEND {
-                        // Method zero params are "arbitrary bytes", so we'll just count them as
-                        // raw.
-                        //
-                        // This won't actually affect anything (because no code will see these
-                        // parameters), but it's more correct and makes me happier.
-                        //
-                        // NOTE: this _may_ start to matter once we start _validating_ ipld (m2.2).
-                        IPLD_RAW
-                    } else {
-                        // This is CBOR, not DAG_CBOR, because links sent from off-chain aren't
-                        // reachable.
-                        CBOR
-                    },
-                    msg.params.bytes(),
-                )
-            });
+            Ok(ret)
+        });
 
-            let result = cm.with_transaction(|cm| {
-                // Invoke the message.
-                let ret = cm.send::<K>(
-                    sender_id,
-                    msg.to,
-                    msg.method_num,
-                    params,
-                    &msg.value,
-                    None,
-                    false,
-                )?;
-
-                // Charge for including the result (before we end the transaction).
-                if let Some(value) = &ret.value {
-                    let _ = cm.charge_gas(
-                        cm.context()
-                            .price_list
-                            .on_chain_return_value(value.size() as usize),
-                    )?;
-                }
-
-                Ok(ret)
-            });
-
-            let (res, machine) = match cm.finish() {
-                (Ok(res), machine) => (res, machine),
-                (Err(err), machine) => return (Err(err), machine),
-            };
-
-            (
-                Ok(MachineExecRet {
-                    result,
-                    gas_used: res.gas_used,
-                    backtrace: res.backtrace,
-                    exec_trace: res.exec_trace,
-                    events_root: res.events_root,
-                    events: res.events,
-                }),
-                machine,
-            )
-        })?;
-
-        let MachineExecRet {
-            result: res,
+        let (res, machine) = cm.finish();
+        self.machine = Some(machine);
+        let FinishRet {
             gas_used,
             mut backtrace,
             exec_trace,
-            events_root,
             events,
-        } = ret;
+            events_root,
+        } = match res {
+            Ok(res) => res,
+            Err(err) => {
+                bail!(err);
+            }
+        };
 
         // Extract the exit code and build the result of the message application.
-        let receipt = match res {
+        let receipt = match result {
             Ok(InvocationResult { exit_code, value }) => {
                 // Convert back into a top-level return "value". We throw away the codec here,
                 // unfortunately.
@@ -536,20 +517,6 @@ where
         })
     }
 
-    fn map_machine<F, T>(&mut self, f: F) -> T
-    where
-        F: FnOnce(
-            <K::CallManager as CallManager>::Machine,
-        ) -> (T, <K::CallManager as CallManager>::Machine),
-    {
-        replace_with::replace_with_and_return(
-            &mut self.machine,
-            || None,
-            |m| {
-                let (ret, machine) = f(m.unwrap());
-                (ret, Some(machine))
-            },
-        )
     // Return a reference to the underlying [`Machine`], panic if it has
     // been poisoned.
     fn machine(&self) -> &<K::CallManager as CallManager>::Machine {
