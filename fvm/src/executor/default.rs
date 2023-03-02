@@ -1,6 +1,5 @@
 // Copyright 2021-2023 Protocol Labs
 // SPDX-License-Identifier: Apache-2.0, MIT
-use std::ops::{Deref, DerefMut};
 use std::result::Result as StdResult;
 
 use anyhow::{anyhow, Result};
@@ -37,20 +36,6 @@ pub struct DefaultExecutor<K: Kernel> {
     machine: Option<<K::CallManager as CallManager>::Machine>,
 }
 
-impl<K: Kernel> Deref for DefaultExecutor<K> {
-    type Target = <K::CallManager as CallManager>::Machine;
-
-    fn deref(&self) -> &Self::Target {
-        self.machine.as_ref().expect("machine poisoned")
-    }
-}
-
-impl<K: Kernel> DerefMut for DefaultExecutor<K> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.machine.as_mut().expect("machine poisoned")
-    }
-}
-
 impl<K> Executor for DefaultExecutor<K>
 where
     K: Kernel,
@@ -80,6 +65,7 @@ where
 
         // Pre-resolve the message receiver's address, if known.
         let receiver_id = self
+            .machine()
             .state_tree()
             .lookup_id(&msg.to)
             .context("failure when looking up message receiver")?;
@@ -89,7 +75,7 @@ where
         let effective_premium = msg
             .gas_premium
             .clone()
-            .min(&msg.gas_fee_cap - &self.context().base_fee)
+            .min(&msg.gas_fee_cap - &self.machine().context().base_fee)
             .max(TokenAmount::zero());
 
         // Acquire an engine from the pool. This may block if there are concurrently executing
@@ -246,7 +232,7 @@ where
                     msg.to,
                     msg.sequence,
                     msg.method_num,
-                    self.context().epoch,
+                    self.machine().context().epoch,
                 ));
                 backtrace.set_cause(backtrace::Cause::from_fatal(err));
                 Receipt {
@@ -292,7 +278,7 @@ where
 
     /// Flush the state-tree to the underlying blockstore.
     fn flush(&mut self) -> anyhow::Result<Cid> {
-        let k = (**self).flush()?;
+        let k = self.machine_mut().flush()?;
         Ok(k)
     }
 }
@@ -345,7 +331,7 @@ where
 
         // TODO We don't like having price lists _inside_ the FVM, but passing
         //  these across the boundary is also a no-go.
-        let pl = &self.context().price_list;
+        let pl = &self.machine().context().price_list;
 
         let (inclusion_cost, miner_penalty_amount) = match apply_kind {
             ApplyKind::Implicit => (
@@ -361,17 +347,18 @@ where
                     return Ok(Err(ApplyRet::prevalidation_fail(
                         ExitCode::SYS_OUT_OF_GAS,
                         format!("Out of gas ({} > {})", inclusion_total, msg.gas_limit),
-                        &self.context().base_fee * inclusion_total,
+                        &self.machine().context().base_fee * inclusion_total,
                     )));
                 }
 
-                let miner_penalty_amount = &self.context().base_fee * msg.gas_limit;
+                let miner_penalty_amount = &self.machine().context().base_fee * msg.gas_limit;
                 (inclusion_cost, miner_penalty_amount)
             }
         };
 
         // Load sender actor state.
         let sender_id = match self
+            .machine()
             .state_tree()
             .lookup_id(&msg.from)
             .with_context(|| format!("failed to lookup actor {}", &msg.from))?
@@ -391,6 +378,7 @@ where
         }
 
         let mut sender_state = match self
+            .machine()
             .state_tree()
             .get_actor(sender_id)
             .with_context(|| format!("failed to lookup actor {}", &msg.from))?
@@ -410,19 +398,23 @@ where
         // - an Ethereum Externally Owned Address
         // - a placeholder actor that has an f4 address in the EAM's namespace
 
-        let mut sender_is_valid = self.builtin_actors().is_account_actor(&sender_state.code)
+        let mut sender_is_valid = self
+            .machine()
+            .builtin_actors()
+            .is_account_actor(&sender_state.code)
             || self
+                .machine()
                 .builtin_actors()
                 .is_ethaccount_actor(&sender_state.code);
 
-        if self.builtin_actors().is_placeholder_actor(&sender_state.code) &&
+        if self.machine().builtin_actors().is_placeholder_actor(&sender_state.code) &&
             sender_state.sequence == 0 &&
             sender_state
                 .delegated_address
                 .map(|a| matches!(a.payload(), Payload::Delegated(da) if da.namespace() == EAM_ACTOR_ID))
                 .unwrap_or(false) {
             sender_is_valid = true;
-            sender_state.code = *self.builtin_actors().get_ethaccount_code();
+            sender_state.code = *self.machine().builtin_actors().get_ethaccount_code();
         }
 
         if !sender_is_valid {
@@ -463,7 +455,9 @@ where
         sender_state.deduct_funds(&gas_cost)?;
 
         // Update the actor in the state tree
-        self.state_tree_mut().set_actor(sender_id, sender_state);
+        self.machine_mut()
+            .state_tree_mut()
+            .set_actor(sender_id, sender_state);
 
         Ok(Ok((sender_id, gas_cost, inclusion_cost)))
     }
@@ -491,7 +485,7 @@ where
         } = GasOutputs::compute(
             receipt.gas_used,
             msg.gas_limit,
-            &self.context().base_fee,
+            &self.machine().context().base_fee,
             &msg.gas_fee_cap,
             &msg.gas_premium,
         );
@@ -504,7 +498,8 @@ where
                 return Ok(());
             }
 
-            self.state_tree_mut()
+            self.machine_mut()
+                .state_tree_mut()
                 .mutate_actor(addr, |act| {
                     act.deposit_funds(amt);
                     Ok(())
@@ -555,5 +550,15 @@ where
                 (ret, Some(machine))
             },
         )
+    // Return a reference to the underlying [`Machine`], panic if it has
+    // been poisoned.
+    fn machine(&self) -> &<K::CallManager as CallManager>::Machine {
+        self.machine.as_ref().expect("machine poisoned")
+    }
+
+    // Return a mutable reference to the underlying [`Machine`], panic if it has
+    // been poisoned.
+    fn machine_mut(&mut self) -> &mut <K::CallManager as CallManager>::Machine {
+        self.machine.as_mut().expect("machine poisoned")
     }
 }
