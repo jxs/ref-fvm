@@ -1,5 +1,6 @@
 // Copyright 2021-2023 Protocol Labs
 // SPDX-License-Identifier: Apache-2.0, MIT
+use std::mem;
 use std::rc::Rc;
 
 use anyhow::{anyhow, Context};
@@ -688,171 +689,165 @@ where
             )?;
 
         log::trace!("calling {} -> {}::{}", from, to, method);
-        self.map_mut(|cm| {
-            let engine = cm.engine.clone(); // reference the RC.
 
-            // Make the kernel.
-            let kernel = K::new(
-                cm,
-                block_registry,
-                from,
-                to,
-                method,
-                value.clone(),
-                read_only,
-            );
+        // Temporarily replace `self` with a version that contains `None` for the inner part,
+        // to be able to hand over ownership of `self` to a new kernel, while the older kernel
+        // has a reference to the hollowed out version.
+        let cm = mem::replace(self, DefaultCallManager(None));
+        let engine = cm.engine.clone(); // reference the RC.
 
-            // Make a store.
-            let mut store = engine.new_store(kernel);
+        // Make the kernel.
+        let kernel = K::new(
+            cm,
+            block_registry,
+            from,
+            to,
+            method,
+            value.clone(),
+            read_only,
+        );
 
-            // From this point on, there are no more syscall errors, only aborts.
-            let result: std::result::Result<BlockId, Abort> = (|| {
-                // Instantiate the module.
-                let instance = engine
-                    .instantiate(&mut store, &state.code)?
-                    .context("actor not found")
-                    .map_err(Abort::Fatal)?;
+        // Make a store.
+        let mut store = engine.new_store(kernel);
 
-                // Resolve and store a reference to the exported memory.
-                let memory = instance
-                    .get_memory(&mut store, "memory")
-                    .context("actor has no memory export")
-                    .map_err(Abort::Fatal)?;
+        // From this point on, there are no more syscall errors, only aborts.
+        let result: std::result::Result<BlockId, Abort> = (|| {
+            // Instantiate the module.
+            let instance = engine
+                .instantiate(&mut store, &state.code)?
+                .context("actor not found")
+                .map_err(Abort::Fatal)?;
 
-                store.data_mut().memory = memory;
+            // Resolve and store a reference to the exported memory.
+            let memory = instance
+                .get_memory(&mut store, "memory")
+                .context("actor has no memory export")
+                .map_err(Abort::Fatal)?;
 
-                // Lookup the invoke method.
-                let invoke: wasmtime::TypedFunc<(u32,), u32> = instance
-                    .get_typed_func(&mut store, "invoke")
-                    // All actors will have an invoke method.
-                    .map_err(Abort::Fatal)?;
+            store.data_mut().memory = memory;
 
-                // Set the available gas.
-                update_gas_available(&mut store)?;
+            // Lookup the invoke method.
+            let invoke: wasmtime::TypedFunc<(u32,), u32> = instance
+                .get_typed_func(&mut store, "invoke")
+                // All actors will have an invoke method.
+                .map_err(Abort::Fatal)?;
 
-                // Invoke it.
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    invoke.call(&mut store, (params_id,))
-                }))
-                .map_err(|panic| Abort::Fatal(anyhow!("panic within actor: {:?}", panic)))?;
+            // Set the available gas.
+            update_gas_available(&mut store)?;
 
-                // Charge for any remaining uncharged execution gas, returning an error if we run
-                // out.
-                charge_for_exec(&mut store)?;
+            // Invoke it.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                invoke.call(&mut store, (params_id,))
+            }))
+            .map_err(|panic| Abort::Fatal(anyhow!("panic within actor: {:?}", panic)))?;
 
-                // If the invocation failed due to running out of exec_units, we have already
-                // detected it and returned OutOfGas above. Any other invocation failure is returned
-                // here as an Abort
-                Ok(res?)
-            })();
+            // Charge for any remaining uncharged execution gas, returning an error if we run
+            // out.
+            charge_for_exec(&mut store)?;
 
-            let invocation_data = store.into_data();
-            let last_error = invocation_data.last_error;
-            let (mut cm, block_registry) = invocation_data.kernel.into_inner();
+            // If the invocation failed due to running out of exec_units, we have already
+            // detected it and returned OutOfGas above. Any other invocation failure is returned
+            // here as an Abort
+            Ok(res?)
+        })();
 
-            // Resolve the return block's ID into an actual block, converting to an abort if it
-            // doesn't exist.
-            let result = result.and_then(|ret_id| {
-                Ok(if ret_id == NO_DATA_BLOCK_ID {
-                    None
-                } else {
-                    Some(block_registry.get(ret_id).map_err(|_| {
-                        Abort::Exit(
+        let invocation_data = store.into_data();
+        let last_error = invocation_data.last_error;
+        let (mut cm, block_registry) = invocation_data.kernel.into_inner();
+
+        // Resolve the return block's ID into an actual block, converting to an abort if it
+        // doesn't exist.
+        let result = result.and_then(|ret_id| {
+            Ok(if ret_id == NO_DATA_BLOCK_ID {
+                None
+            } else {
+                Some(block_registry.get(ret_id).map_err(|_| {
+                    Abort::Exit(
+                        ExitCode::SYS_MISSING_RETURN,
+                        String::from("returned block does not exist"),
+                        NO_DATA_BLOCK_ID,
+                    )
+                })?)
+            })
+        });
+
+        // Process the result, updating the backtrace if necessary.
+        let ret = match result {
+            Ok(ret) => Ok(InvocationResult {
+                exit_code: ExitCode::OK,
+                value: ret.cloned(),
+            }),
+            Err(abort) => {
+                let (code, message, res) = match abort {
+                    Abort::Exit(code, message, NO_DATA_BLOCK_ID) => (
+                        code,
+                        message,
+                        Ok(InvocationResult {
+                            exit_code: code,
+                            value: None,
+                        }),
+                    ),
+                    Abort::Exit(code, message, blk_id) => match block_registry.get(blk_id) {
+                        Err(e) => (
                             ExitCode::SYS_MISSING_RETURN,
-                            String::from("returned block does not exist"),
-                            NO_DATA_BLOCK_ID,
-                        )
-                    })?)
-                })
-            });
-
-            // Process the result, updating the backtrace if necessary.
-            let ret = match result {
-                Ok(ret) => Ok(InvocationResult {
-                    exit_code: ExitCode::OK,
-                    value: ret.cloned(),
-                }),
-                Err(abort) => {
-                    let (code, message, res) = match abort {
-                        Abort::Exit(code, message, NO_DATA_BLOCK_ID) => (
+                            "error getting exit data block".to_owned(),
+                            Err(ExecutionError::Fatal(anyhow!(e))),
+                        ),
+                        Ok(blk) => (
                             code,
                             message,
                             Ok(InvocationResult {
                                 exit_code: code,
-                                value: None,
+                                value: Some(blk.clone()),
                             }),
                         ),
-                        Abort::Exit(code, message, blk_id) => match block_registry.get(blk_id) {
-                            Err(e) => (
-                                ExitCode::SYS_MISSING_RETURN,
-                                "error getting exit data block".to_owned(),
-                                Err(ExecutionError::Fatal(anyhow!(e))),
-                            ),
-                            Ok(blk) => (
-                                code,
-                                message,
-                                Ok(InvocationResult {
-                                    exit_code: code,
-                                    value: Some(blk.clone()),
-                                }),
-                            ),
-                        },
-                        Abort::OutOfGas => (
-                            ExitCode::SYS_OUT_OF_GAS,
-                            "out of gas".to_owned(),
-                            Err(ExecutionError::OutOfGas),
-                        ),
-                        Abort::Fatal(err) => (
-                            ExitCode::SYS_ASSERTION_FAILED,
-                            "fatal error".to_owned(),
-                            Err(ExecutionError::Fatal(err)),
-                        ),
-                    };
+                    },
+                    Abort::OutOfGas => (
+                        ExitCode::SYS_OUT_OF_GAS,
+                        "out of gas".to_owned(),
+                        Err(ExecutionError::OutOfGas),
+                    ),
+                    Abort::Fatal(err) => (
+                        ExitCode::SYS_ASSERTION_FAILED,
+                        "fatal error".to_owned(),
+                        Err(ExecutionError::Fatal(err)),
+                    ),
+                };
 
-                    if !code.is_success() {
-                        if let Some(err) = last_error {
-                            cm.backtrace.begin(err);
-                        }
-
-                        cm.backtrace.push_frame(Frame {
-                            source: to,
-                            method,
-                            message,
-                            code,
-                        });
+                if !code.is_success() {
+                    if let Some(err) = last_error {
+                        cm.backtrace.begin(err);
                     }
 
-                    res
-                }
-            };
-
-            // Log the results if tracing is enabled.
-            if log::log_enabled!(log::Level::Trace) {
-                match &ret {
-                    Ok(val) => log::trace!(
-                        "returning {}::{} -> {} ({})",
-                        to,
+                    cm.backtrace.push_frame(Frame {
+                        source: to,
                         method,
-                        from,
-                        val.exit_code
-                    ),
-                    Err(e) => log::trace!("failing {}::{} -> {} (err:{})", to, method, from, e),
+                        message,
+                        code,
+                    });
                 }
+
+                res
             }
+        };
 
-            t.stop();
-            (ret, cm)
-        })
-    }
+        // Log the results if tracing is enabled.
+        if log::log_enabled!(log::Level::Trace) {
+            match &ret {
+                Ok(val) => log::trace!(
+                    "returning {}::{} -> {} ({})",
+                    to,
+                    method,
+                    from,
+                    val.exit_code
+                ),
+                Err(e) => log::trace!("failing {}::{} -> {} (err:{})", to, method, from, e),
+            }
+        }
 
-    /// Temporarily replace `self` with a version that contains `None` for the inner part,
-    /// to be able to hand over ownership of `self` to a new kernel, while the older kernel
-    /// has a reference to the hollowed out version.
-    fn map_mut<F, T>(&mut self, f: F) -> T
-    where
-        F: FnOnce(Self) -> (T, Self),
-    {
-        replace_with::replace_with_and_return(self, || DefaultCallManager(None), f)
+        t.stop();
+        let _ = mem::replace(self, cm);
+        ret
     }
 
     /// Check that we're not violating the call stack depth, then envelope a call

@@ -2437,7 +2437,6 @@ dependencies = [
  "quickcheck",
  "rand",
  "rayon",
- "replace_with",
  "serde",
  "serde_repr",
  "serde_tuple",
